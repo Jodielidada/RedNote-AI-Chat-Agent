@@ -1,106 +1,153 @@
-# 小红书博主AI对话系统
+# RedNote AI Chat Agent
 
-输入小红书笔记链接，自动提取内容（图片、视频、文字），基于内容与 AI 对话，像直接和博主聊天一样。
+Chat with any RedNote (小红书) post or creator — paste a link, and the AI extracts the full content (text, images, video) and lets you have a real conversation about it.
 
-## 技术栈
+> **Total cost: $0** — built entirely on free-tier APIs and open-source tools.
 
-- **前端**: Next.js 14 (App Router)、TypeScript、Tailwind CSS
-- **后端**: Python FastAPI、Playwright、Whisper、PaddleOCR
-- **AI**: Groq API（免费）、ChromaDB、sentence-transformers
+---
 
-**总成本 ¥0**
+## What it does
 
-## 项目结构
+- **Single post**: paste a note link → AI reads the full text, OCR-scans images, and transcribes video audio
+- **Creator profile**: paste a profile link → AI ingests the creator's recent posts and lets you chat *as if you're talking to the creator*
+- **Smart paste**: automatically extracts the URL from the messy share text RedNote copies to your clipboard
+- **Multi-turn chat**: remembers the conversation history within each session
+
+---
+
+## Tech stack
+
+| Layer | Tools |
+|---|---|
+| Frontend | Next.js 14, TypeScript, Tailwind CSS |
+| Backend | Python, FastAPI, Playwright (headless Chrome) |
+| AI | [Groq API](https://console.groq.com) — Llama 3.1 8B (free) |
+| Video | faster-whisper (local Whisper transcription) + yt-dlp + ffmpeg |
+| OCR | PaddleOCR (Chinese + English) |
+
+---
+
+## Project structure
 
 ```
-xiaohongshu-chat/
-├── frontend/           # Next.js 前端
-│   ├── app/
-│   │   ├── page.tsx
-│   │   └── layout.tsx
-│   └── package.json
-├── backend/            # Python 后端
-│   ├── main.py         # FastAPI 主程序
-│   ├── crawler.py      # 小红书爬虫
-│   ├── video_processor.py
-│   ├── ocr_processor.py
+RedNote-AI-Chat-Agent/
+├── frontend/
+│   └── app/
+│       ├── page.tsx        # Main chat UI
+│       └── layout.tsx
+├── backend/
+│   ├── main.py             # FastAPI app + TTL session store
+│   ├── crawler.py          # Playwright-based RedNote scraper
+│   ├── video_processor.py  # yt-dlp + ffmpeg + Whisper
+│   ├── ocr_processor.py    # PaddleOCR image text extraction
 │   └── requirements.txt
 └── README.md
 ```
 
-## 环境准备
+---
 
-### 系统依赖
+## Setup
+
+### Prerequisites
 
 ```bash
 # macOS
-brew install python@3.11 node ffmpeg tesseract
+brew install python@3.11 node ffmpeg
 
 # Ubuntu
-sudo apt update
-sudo apt install python3.11 python3-pip nodejs npm ffmpeg tesseract-ocr tesseract-ocr-chi-sim
+sudo apt install python3.11 nodejs npm ffmpeg
 ```
 
-### 后端
+### 1. Backend
 
 ```bash
 cd backend
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
+python3 -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
 pip install -r requirements.txt
 playwright install chromium
 ```
 
-复制环境变量并填写 Groq API Key（[免费申请](https://console.groq.com)）：
+Create your `.env` file:
 
 ```bash
 cp .env.example .env
-# 编辑 .env，设置 GROQ_API_KEY=your_groq_api_key_here
 ```
 
-### 前端
+Open `.env` and set your Groq API key (free at [console.groq.com](https://console.groq.com)):
+
+```
+GROQ_API_KEY=your_key_here
+```
+
+### 2. Frontend
 
 ```bash
 cd frontend
 npm install
 ```
 
-## 运行
+---
 
-**终端 1 - 后端**
+## Running
 
+Open **two terminals**:
+
+**Terminal 1 — backend**
 ```bash
 cd backend
 source venv/bin/activate
-python main.py
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-API 文档: http://localhost:8000/docs
-
-**终端 2 - 前端**
-
+**Terminal 2 — frontend**
 ```bash
 cd frontend
 npm run dev
 ```
 
-打开 http://localhost:3000
+Then open **http://localhost:3000**
 
-## 使用流程
+---
 
-1. 在首页输入小红书笔记链接
-2. 点击「开始分析」（视频约 1–2 分钟，图文约 10–30 秒）
-3. 进入对话页，基于该笔记内容提问
+## How to use
 
-## 常见问题
+1. Copy any RedNote share link (the whole text — URL extractor handles the extra copy text automatically)
+2. Paste into the input box and click **Start Analysis**
+3. Wait for processing (image posts ~10–30s, video posts ~1–5 min)
+4. Chat freely about the content
 
-- **爬虫失败**: 开发时可在 `crawler.py` 中设 `headless=False`，手动登录小红书后 cookies 会保存
-- **视频下载失败**: 确保已安装 `yt-dlp` 和 `ffmpeg`
-- **Groq 限流**: 可加重试或降低请求频率
+---
 
-## 部署建议
+## Optional: stay logged in to RedNote
 
-- 前端: Vercel（免费）
-- 后端: Railway / Render（有免费额度）
+If posts are blocked behind login, point the crawler at your real Chrome profile:
 
-祝开发顺利。
+```bash
+# In backend/.env
+CHROME_USER_DATA_DIR="/Users/yourname/Library/Application Support/Google/Chrome"
+```
+
+The crawler uses a separate `_crawler` copy of the profile so it never conflicts with your running Chrome.
+
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| Crawl returns login page | Set `CHROME_USER_DATA_DIR` (see above) |
+| Video transcription missing | Install `faster-whisper`: `pip install faster-whisper` |
+| OCR not working | PaddleOCR requires Python ≤ 3.12; skip or use a compatible env |
+| Groq rate limit | Lower request frequency or upgrade to a paid Groq plan |
+
+---
+
+## Deployment
+
+| Service | Notes |
+|---|---|
+| Frontend | [Vercel](https://vercel.com) (free) |
+| Backend | [Railway](https://railway.app) or [Render](https://render.com) (free tier available) |
+
+> Note: the Playwright crawler requires a full Chrome install — serverless platforms won't work for the backend. Use a container-based host.
