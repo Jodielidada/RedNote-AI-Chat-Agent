@@ -5,19 +5,16 @@ import asyncio
 import json
 import os
 import re
-from typing import Optional, Tuple, Any
+from typing import Optional
 
 try:
     import requests
 except ImportError:
     requests = None
 
-# 全局锁：保证一次只跑一个浏览器任务，避免多请求同时开多个 Chrome
-CRAWL_LOCK = asyncio.Lock()
-
 
 def _resolve_short_link(url: str) -> Optional[str]:
-    """Resolve xhslink.com short URL to final xiaohongshu URL (desktop)."""
+    """Resolve xhslink.com short URL to final xiaohongshu URL."""
     if not requests or "xhslink.com" not in (url or ""):
         return None
     try:
@@ -39,26 +36,25 @@ def _resolve_short_link(url: str) -> Optional[str]:
 
 def _get_chrome_profile_dir() -> Optional[str]:
     """
-    若设置了 CHROME_USER_DATA_DIR，使用「爬虫专用副本」目录（原路径 + _crawler），
-    避免与正在运行的 Chrome 抢同一配置（SingletonLock）。该副本首次为空，需在脚本里登录一次小红书后即可沿用。
+    Return a crawler-exclusive copy of the Chrome profile dir so it never
+    conflicts with a running Chrome instance (SingletonLock).
     """
     profile = os.environ.get("CHROME_USER_DATA_DIR", "").strip()
     if not profile:
         return None
     base = os.path.expanduser(profile)
-    # 使用独立目录，不与本机 Chrome 冲突，无需退出 Chrome
     crawler_dir = base.rstrip("/") + "_crawler"
     try:
         if not os.path.isdir(crawler_dir):
             os.makedirs(crawler_dir, exist_ok=True)
-        print(f"📌 使用爬虫专用配置目录（与 Chrome 互不干扰）: {crawler_dir}")
+        print(f"📌 使用爬虫专用配置目录: {crawler_dir}")
         return crawler_dir
     except Exception as e:
         print(f"⚠️ 无法创建爬虫配置目录 {crawler_dir}: {e}")
         return None
 
 
-def _common_browser_options(headless: bool = True):
+def _common_browser_options():
     args = ["--disable-blink-features=AutomationControlled"]
     viewport = {"width": 1920, "height": 1080}
     user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -67,15 +63,14 @@ def _common_browser_options(headless: bool = True):
 
 async def _launch_context(p, headless: bool = True):
     """
-    If CHROME_USER_DATA_DIR is set -> launch_persistent_context to reuse login.
-    Else -> launch + new_context (then we can load cookies.json).
+    Persistent context (reuses login) when CHROME_USER_DATA_DIR is set;
+    otherwise a fresh context that loads cookies.json.
     Returns (context, browser_or_none).
     """
-    args, viewport, user_agent = _common_browser_options(headless=headless)
+    args, viewport, user_agent = _common_browser_options()
     profile_dir = _get_chrome_profile_dir()
 
     if profile_dir:
-        # ✅ persistent context reuses real Chrome profile (login/cookies/localstorage)
         try:
             context = await p.chromium.launch_persistent_context(
                 user_data_dir=profile_dir,
@@ -89,7 +84,7 @@ async def _launch_context(p, headless: bool = True):
         except Exception as e:
             err = str(e).lower()
             if "singletonlock" in err or "processsingleton" in err or "profile" in err:
-                print("⚠️ 无法启动浏览器配置目录。若未使用 _crawler 副本，请完全退出 Chrome（⌘Q）后再试。")
+                print("⚠️ 无法启动浏览器配置目录，请确认未用同一 _crawler 目录启动其他实例。")
             raise
 
     browser = await p.chromium.launch(
@@ -97,47 +92,59 @@ async def _launch_context(p, headless: bool = True):
         headless=headless,
         args=args,
     )
-    context = await browser.new_context(
-        viewport=viewport,
-        user_agent=user_agent,
-    )
+    context = await browser.new_context(viewport=viewport, user_agent=user_agent)
     return context, browser
 
 
+# ── Cookies file path (configurable, kept outside the repo by default) ────────
+_COOKIES_FILE = os.environ.get(
+    "XHS_COOKIES_FILE",
+    os.path.join(os.path.expanduser("~"), ".xhs_cookies.json"),
+)
+
+
 class XiaohongshuCrawler:
-    def __init__(self):
-        self.cookies_file = "cookies.json"
+    def __init__(self, max_concurrent: int = 2):
+        # Semaphore replaces the old global lock: allows up to max_concurrent
+        # parallel browser sessions instead of serialising everything.
+        self._sem = asyncio.Semaphore(max_concurrent)
+
+    # ── Cookie persistence (non-persistent context only) ──────────────────────
 
     def save_cookies_sync(self, cookies: list):
-        """保存cookies避免重复登录（仅用于非 persistent 模式）"""
         try:
-            with open(self.cookies_file, "w") as f:
+            with open(_COOKIES_FILE, "w") as f:
                 json.dump(cookies, f)
+            os.chmod(_COOKIES_FILE, 0o600)  # owner-readable only
         except Exception:
             pass
 
     def load_cookies_sync(self) -> list:
-        """加载已保存的cookies（仅用于非 persistent 模式）"""
-        if os.path.exists(self.cookies_file):
+        if os.path.exists(_COOKIES_FILE):
             try:
-                with open(self.cookies_file, "r") as f:
+                with open(_COOKIES_FILE, "r") as f:
                     return json.load(f)
             except Exception:
                 return []
         return []
 
+    # ── URL helpers ───────────────────────────────────────────────────────────
+
     @staticmethod
     def is_profile_url(url: str) -> bool:
-        """Check if URL is a user profile page (full or short link)."""
-        u = (url or "").lower()
-        return "/user/profile/" in u or "xhslink.com/m/" in u
+        """Return True for any recognised user-profile URL form."""
+        u = (url or "").lower().split("?")[0]  # ignore query params
+        patterns = [
+            "/user/profile/",
+            "xhslink.com/m/",
+            "/u/",               # alternate short profile path
+        ]
+        return any(p in u for p in patterns)
+
+    # ── Profile: collect post links ───────────────────────────────────────────
 
     async def get_profile_post_links(self, profile_url: str, max_posts: int = 10) -> list[str]:
-        """
-        打开博主主页，通过「点击笔记卡片 → 等跳转到 /explore/<id> → 记录 URL → 返回」拿笔记链接。
-        不依赖 DOM 里的 href（主页常只有 /explore/ 占位）。支持短链 xhslink.com 先解析再打开。
-        """
-        async with CRAWL_LOCK:
+        async with self._sem:
             async with async_playwright() as p:
                 context, browser = await _launch_context(p, headless=True)
 
@@ -153,7 +160,6 @@ class XiaohongshuCrawler:
                 links: list[str] = []
 
                 try:
-                    # 短链先解析成 profile URL 再打开
                     if "xhslink.com" in profile_url:
                         resolved = await asyncio.to_thread(_resolve_short_link, profile_url)
                         if resolved:
@@ -164,12 +170,10 @@ class XiaohongshuCrawler:
                     await page.goto(profile_url, wait_until="domcontentloaded", timeout=60_000)
                     await page.wait_for_timeout(2500)
 
-                    # 滚动让卡片加载（多滚几次）
                     for _ in range(6):
                         await page.mouse.wheel(0, 1200)
                         await page.wait_for_timeout(800)
 
-                    # 先尽量关掉可能遮挡的弹窗/遮罩
                     try:
                         await page.keyboard.press("Escape")
                     except Exception:
@@ -180,7 +184,6 @@ class XiaohongshuCrawler:
                     )
                     print("🔎 explore href 样本前5条:", sample)
 
-                    # 直接从 DOM 提取 explore 链接（不点击，避免不可见/弹层等问题）
                     links = await page.evaluate(
                         """() => {
   const base = 'https://www.xiaohongshu.com';
@@ -204,7 +207,7 @@ class XiaohongshuCrawler:
                     if not isinstance(links, list):
                         links = []
                     result = links[:max_posts]
-                    print(f"✅ 直接从 DOM 抽取到 {len(links)} 条笔记链接，将返回前 {len(result)} 条")
+                    print(f"✅ 从 DOM 抽取到 {len(links)} 条笔记链接，返回前 {len(result)} 条")
 
                     if browser is not None:
                         try:
@@ -213,7 +216,6 @@ class XiaohongshuCrawler:
                         except Exception:
                             pass
 
-                    print(f"✅ 最终拿到 {len(links)} 条笔记链接")
                     return result
 
                 except Exception as e:
@@ -230,16 +232,13 @@ class XiaohongshuCrawler:
                         except Exception:
                             pass
 
+    # ── Single post ───────────────────────────────────────────────────────────
+
     async def crawl(self, url: str):
-        """
-        爬取小红书笔记
-        支持：图文笔记、视频笔记
-        """
-        async with CRAWL_LOCK:
+        async with self._sem:
             async with async_playwright() as p:
                 context, browser = await _launch_context(p, headless=True)
 
-                # 只有非 persistent 才加载 cookies.json（persistent 直接用本机 Chrome 登录态）
                 if browser is not None:
                     cookies = self.load_cookies_sync()
                     if cookies:
@@ -249,7 +248,6 @@ class XiaohongshuCrawler:
                             pass
 
                 page = await context.new_page()
-
                 captured_video_urls = []
 
                 def handle_response(response):
@@ -284,22 +282,16 @@ class XiaohongshuCrawler:
                         pass
                     await page.wait_for_timeout(800)
 
-                    # 提取标题
+                    # Extract title
                     title = ""
-                    title_selectors = [
-                        "#detail-title",
-                        '[class*="detail-title"]',
-                        '[class*="Title"]',
-                        ".title",
-                        "h1",
-                        '[class*="note-title"]',
-                    ]
-                    for sel in title_selectors:
+                    for sel in [
+                        "#detail-title", '[class*="detail-title"]', '[class*="Title"]',
+                        ".title", "h1", '[class*="note-title"]',
+                    ]:
                         try:
                             elem = page.locator(sel).first
                             if await elem.count() > 0:
-                                t = (await elem.text_content()) or ""
-                                t = t.strip()
+                                t = (await elem.text_content() or "").strip()
                                 if t and 2 < len(t) < 200:
                                     title = t
                                     break
@@ -308,39 +300,29 @@ class XiaohongshuCrawler:
                     if not title:
                         try:
                             title = (await page.title() or "").strip()
-                            if " - 小红书" in title:
-                                title = title.replace(" - 小红书", "").strip()
+                            title = title.replace(" - 小红书", "").strip()
                             if len(title) < 2:
                                 title = ""
                         except Exception:
                             pass
 
-                    # 提取正文内容
+                    # Extract body text
                     content = ""
-                    content_selectors = [
-                        "#detail-desc",
-                        '[class*="detail-desc"]',
-                        '[class*="Desc"]',
-                        '[class*="note-desc"]',
-                        '[class*="description"]',
-                        ".desc",
-                        '[class*="content"]',
-                        "article",
-                        ".note-text",
-                    ]
-                    for sel in content_selectors:
+                    for sel in [
+                        "#detail-desc", '[class*="detail-desc"]', '[class*="Desc"]',
+                        '[class*="note-desc"]', '[class*="description"]', ".desc",
+                        '[class*="content"]', "article", ".note-text",
+                    ]:
                         try:
                             elem = page.locator(sel).first
                             if await elem.count() > 0:
-                                c = (await elem.text_content()) or ""
-                                c = c.strip()
+                                c = (await elem.text_content() or "").strip()
                                 if c and len(c) > 10:
                                     content = c[:5000]
                                     break
                         except Exception:
                             continue
 
-                    # 兜底：从主内容区提取所有可见文字
                     if not content or len(content) < 20:
                         try:
                             full_text = await page.evaluate(
@@ -350,12 +332,12 @@ class XiaohongshuCrawler:
                             }"""
                             )
                             if full_text and isinstance(full_text, str):
-                                lines = [l.strip() for l in full_text.split("\\n") if len(l.strip()) > 5]
-                                content = "\\n".join(lines[:50])[:3000] if lines else content
+                                lines = [l.strip() for l in full_text.split("\n") if len(l.strip()) > 5]
+                                content = "\n".join(lines[:50])[:3000] if lines else content
                         except Exception:
                             pass
 
-                    # 检测是否为视频
+                    # Detect video
                     video_url = None
                     has_video_element = False
                     try:
@@ -364,12 +346,11 @@ class XiaohongshuCrawler:
                             const video = document.querySelector('video');
                             if (!video) return { url: null, hasVideo: false };
                             const u = video.src || video.currentSrc;
-                            const hasVideo = true;
-                            if (u && u.startsWith('http') && !u.startsWith('blob:')) return { url: u, hasVideo };
+                            if (u && u.startsWith('http') && !u.startsWith('blob:')) return { url: u, hasVideo: true };
                             const s = video.querySelector('source');
-                            if (s && s.src && !s.src.startsWith('blob:')) return { url: s.src, hasVideo };
-                            if (s) { const src = s.getAttribute('src'); if (src && !src.startsWith('blob:')) return { url: src, hasVideo }; }
-                            return { url: null, hasVideo };
+                            if (s && s.src && !s.src.startsWith('blob:')) return { url: s.src, hasVideo: true };
+                            if (s) { const src = s.getAttribute('src'); if (src && !src.startsWith('blob:')) return { url: src, hasVideo: true }; }
+                            return { url: null, hasVideo: true };
                         }"""
                         )
                         if isinstance(out, dict):
@@ -391,7 +372,7 @@ class XiaohongshuCrawler:
                             video_url = None
 
                         if not video_url and captured_video_urls:
-                            seen = set()
+                            seen: set = set()
                             for u in captured_video_urls:
                                 if u not in seen and "http" in u and "blob" not in u:
                                     seen.add(u)
@@ -401,31 +382,31 @@ class XiaohongshuCrawler:
                     except Exception:
                         pass
 
-                    # 提取图片
+                    # Extract images
                     images = []
                     try:
                         img_elements = await page.locator('img[class*="note"], img[class*="photo"]').all()
                         for img in img_elements[:10]:
                             src = await img.get_attribute("src")
-                            if src and ("http" in src) and ("avatar" not in src):
+                            if src and "http" in src and "avatar" not in src:
                                 images.append(src)
                     except Exception:
                         pass
 
-                    # 非 persistent 模式保存 cookies.json（persistent 不需要）
                     if browser is not None:
                         try:
-                            cookies = await context.cookies()
-                            self.save_cookies_sync(cookies)
+                            ck = await context.cookies()
+                            self.save_cookies_sync(ck)
                         except Exception:
                             pass
 
                     if content and len(content) < 120:
                         print("⚠️ 正文偏短，可能未加载到真实内容/被风控")
                     if not title:
-                        print("⚠️ 标题未提取到（可能 selector 失效或内容未加载）")
+                        print("⚠️ 标题未提取到")
 
-                    result = {
+                    print(f"✅ 爬取成功 | 标题:{title[:40] if title else '(未提取)'} | 正文:{len(content)}字")
+                    return {
                         "success": True,
                         "url": url,
                         "title": title,
@@ -435,16 +416,9 @@ class XiaohongshuCrawler:
                         "images": images,
                     }
 
-                    print(f"✅ 爬取成功 | 标题:{title[:40] if title else '(未提取)'} | 正文:{len(content)}字")
-                    return result
-
                 except Exception as e:
                     print(f"❌ 爬取失败: {str(e)}")
-                    return {
-                        "success": False,
-                        "error": str(e),
-                        "url": url,
-                    }
+                    return {"success": False, "error": str(e), "url": url}
                 finally:
                     try:
                         await context.close()
@@ -457,12 +431,10 @@ class XiaohongshuCrawler:
                             pass
 
 
-# 测试代码（需用 asyncio.run 运行）
 if __name__ == "__main__":
-    crawler = XiaohongshuCrawler()
-
     async def main():
-        result = await crawler.crawl("https://www.xiaohongshu.com/explore/xxx")  # 替换为实际URL
+        c = XiaohongshuCrawler()
+        result = await c.crawl("https://www.xiaohongshu.com/explore/xxx")
         print(json.dumps(result, ensure_ascii=False, indent=2))
 
     asyncio.run(main())

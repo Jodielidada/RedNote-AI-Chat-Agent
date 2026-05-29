@@ -25,6 +25,11 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
+  const extractUrl = (text: string): string => {
+    const match = text.match(/https?:\/\/[^\s　\u300】）)]+/);
+    return match ? match[0] : text;
+  };
+
   const handleCrawl = async () => {
     if (!url.trim()) {
       setError('Please enter a post or profile link');
@@ -178,7 +183,7 @@ export default function Home() {
               <input
                 type="text"
                 value={url}
-                onChange={(e) => setUrl(e.target.value)}
+                onChange={(e) => setUrl(extractUrl(e.target.value))}
                 onKeyPress={(e) => e.key === 'Enter' && handleCrawl()}
                 placeholder="https://www.xiaohongshu.com/explore/... or .../user/profile/..."
                 className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-transparent"

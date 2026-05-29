@@ -4,27 +4,23 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
-from dotenv import load_dotenv
+import time
 import hashlib
+from dotenv import load_dotenv
 
-# 导入自定义模块
 from crawler import XiaohongshuCrawler
 from video_processor import VideoProcessor
 from ocr_processor import OCRProcessor
 
-# AI相关
 from groq import Groq
 
-# 加载环境变量
 load_dotenv()
 
-# 初始化FastAPI
 app = FastAPI(title="RedNote AI Chat")
 
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
-    """Return JSON for unhandled errors so the frontend can show a proper message."""
     if isinstance(exc, HTTPException):
         raise exc
     import traceback
@@ -36,7 +32,6 @@ async def global_exception_handler(request, exc):
     )
 
 
-# CORS设置
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000"],
@@ -45,23 +40,72 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 初始化组件
+
+# ── TTL-bounded in-memory store (max 200 entries, 2-hour TTL) ─────────────────
+class TTLStore:
+    def __init__(self, max_size: int = 200, ttl: int = 7200):
+        self._store: dict = {}
+        self._times: dict = {}
+        self._max_size = max_size
+        self._ttl = ttl
+
+    def _evict_one(self, key: str):
+        if key in self._times and time.time() - self._times[key] > self._ttl:
+            self._store.pop(key, None)
+            self._times.pop(key, None)
+
+    def _evict_expired(self):
+        now = time.time()
+        stale = [k for k, t in list(self._times.items()) if now - t > self._ttl]
+        for k in stale:
+            self._store.pop(k, None)
+            self._times.pop(k, None)
+
+    def __contains__(self, key: str) -> bool:
+        self._evict_one(key)
+        return key in self._store
+
+    def __getitem__(self, key: str):
+        self._evict_one(key)
+        return self._store[key]
+
+    def __setitem__(self, key: str, value):
+        self._evict_expired()
+        if key not in self._store and len(self._store) >= self._max_size:
+            oldest = min(self._times, key=lambda k: self._times[k])
+            self._store.pop(oldest, None)
+            self._times.pop(oldest, None)
+        self._store[key] = value
+        self._times[key] = time.time()
+
+    def get(self, key: str, default=None):
+        return self._store[key] if key in self else default
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+
 print("🚀 正在初始化系统...")
+
+_api_key = os.getenv("GROQ_API_KEY")
+if not _api_key:
+    raise RuntimeError("GROQ_API_KEY is not set. Please add it to .env before starting.")
 
 crawler = XiaohongshuCrawler()
 video_processor = VideoProcessor()
-ocr_processor = OCRProcessor()
+ocr_processor = OCRProcessor()  # lazy — no heavy init until first image is processed
 
-groq_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-# 简单内存存储（按 post_id 查找，无需向量数据库）
-posts_store: dict[str, dict] = {}
+groq_client = Groq(api_key=_api_key)
+
+posts_store = TTLStore(max_size=200, ttl=7200)
 
 print("✅ 系统初始化完成")
 
-# 数据模型
+
+# ── Data models ───────────────────────────────────────────────────────────────
+
 class CrawlRequest(BaseModel):
     url: str
-    max_posts: int = 3  # 博主主页默认只抓 3 条，减少超时；稳定后可让前端传更大值
+    max_posts: int = 3
 
 
 class ChatRequest(BaseModel):
@@ -69,41 +113,30 @@ class ChatRequest(BaseModel):
     post_id: str
 
 
-# API路由
-
-
-@app.get("/")
-async def root():
-    return {"message": "RedNote AI Chat API"}
-
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _is_login_or_security_page(crawl_result: dict) -> bool:
-    """Only treat as login/security page when content is clearly that (short + login keywords), not normal notes."""
     title = (crawl_result.get("title") or "").strip().lower()
     content = (crawl_result.get("content") or "").strip().lower()
     combined = f"{title} {content}"
-    # Strong login-page phrases (title or full content)
     strong_keywords = [
         "account security", "expires in 1 minute", "scan the qr code", "scan qr code",
         "扫码登录", "请登录", "登录以继续", "安全验证",
     ]
     if any(k in combined for k in strong_keywords):
-        # Only flag if content is short (real notes have more text)
         if len(combined) < 150:
             return True
-        # Or if title itself is a login prompt
         if any(k in title for k in ["扫码", "请登录", "account security", "登录以继续"]):
             return True
     return False
 
 
-def _build_full_content(crawl_result: dict, video_processor, ocr_processor) -> str:
-    """Turn one crawl result into full_content (text + optional video transcript + OCR)."""
+def _build_full_content(crawl_result: dict, vp: VideoProcessor, op: OCRProcessor) -> str:
     full = f"Title: {crawl_result['title']}\n\n{crawl_result['content']}"
     if crawl_result["type"] == "video":
         if crawl_result.get("video_url"):
             print("🎬 检测到视频，开始处理...")
-            video_result = video_processor.process_video(crawl_result["video_url"])
+            video_result = vp.process_video(crawl_result["video_url"])
             if video_result.get("success"):
                 full += f"\n\n[Video transcript]\n{video_result['transcript']}"
                 print(f"✅ 视频转录完成: {len(video_result['transcript'])}字")
@@ -114,18 +147,22 @@ def _build_full_content(crawl_result: dict, video_processor, ocr_processor) -> s
             full += "\n\n[This post is a video. Video URL could not be extracted from the page.]"
     if crawl_result.get("images"):
         print(f"📷 检测到{len(crawl_result['images'])}张图片，开始OCR...")
-        ocr_text = ocr_processor.process_images(crawl_result["images"][:3])
+        ocr_text = op.process_images(crawl_result["images"][:3])
         if ocr_text:
             full += f"\n\n[Image OCR text]\n{ocr_text}"
             print(f"✅ OCR完成: {len(ocr_text)}字")
     return full
 
 
+# ── Routes ────────────────────────────────────────────────────────────────────
+
+@app.get("/")
+async def root():
+    return {"message": "RedNote AI Chat API"}
+
+
 @app.post("/api/crawl")
 async def crawl_post(req: CrawlRequest):
-    """
-    Crawl a single post URL or a profile URL (first 5–10 posts merged).
-    """
     try:
         print(f"\n{'='*50}")
         print(f"📥 收到爬取请求: {req.url}")
@@ -133,7 +170,6 @@ async def crawl_post(req: CrawlRequest):
         is_profile = crawler.is_profile_url(req.url)
 
         if is_profile:
-            # --- Profile: get post links, then crawl each and merge ---
             post_urls = await crawler.get_profile_post_links(req.url, max_posts=req.max_posts)
             if not post_urls:
                 raise HTTPException(
@@ -151,7 +187,7 @@ async def crawl_post(req: CrawlRequest):
                     print(f"⚠️ 跳过失败: {crawl_result.get('error')}")
                     continue
                 if _is_login_or_security_page(crawl_result):
-                    print(f"⚠️ 跳过登录/安全页，不纳入内容")
+                    print("⚠️ 跳过登录/安全页，不纳入内容")
                     continue
                 part = _build_full_content(crawl_result, video_processor, ocr_processor)
                 full_content_parts.append(f"\n\n--- Post {i} ---\n{part}")
@@ -169,7 +205,6 @@ async def crawl_post(req: CrawlRequest):
             post_id = hashlib.md5(req.url.encode()).hexdigest()[:12]
             display_title = "Happy to talk with you"
         else:
-            # --- Single post ---
             crawl_result = await crawler.crawl(req.url)
             if not crawl_result["success"]:
                 raise HTTPException(
@@ -187,9 +222,9 @@ async def crawl_post(req: CrawlRequest):
             total_images = len(crawl_result.get("images") or [])
             has_video = bool(crawl_result.get("video_url"))
 
-        # Store
         posts_store[post_id] = {
             "content": full_content,
+            "history": [],  # multi-turn chat history
             "metadata": {
                 "url": req.url,
                 "title": display_title,
@@ -199,11 +234,10 @@ async def crawl_post(req: CrawlRequest):
         print(f"💾 存储完成! PostID: {post_id} | 总字数: {len(full_content)}")
         print(f"{'='*50}\n")
 
-        # 确保返回结构完整、字段可序列化，避免前端拿到 200 却解析失败
         content_preview = (full_content or "")[:500]
         if len(full_content or "") > 500:
             content_preview += "..."
-        payload = {
+        return {
             "success": True,
             "post_id": str(post_id),
             "data": {
@@ -215,13 +249,11 @@ async def crawl_post(req: CrawlRequest):
                 "total_content_length": int(len(full_content or "")),
             },
         }
-        return payload
 
     except HTTPException:
         raise
     except Exception as e:
         import traceback
-
         print(f"❌ 错误: {str(e)}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -229,22 +261,20 @@ async def crawl_post(req: CrawlRequest):
 
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
-    """
-    基于笔记内容进行AI对话
-    """
     try:
         print(f"\n💬 收到对话请求: {req.message}")
 
-        # 1. 从存储获取笔记内容
         if req.post_id not in posts_store:
             raise HTTPException(
                 status_code=404,
                 detail="Post not found. Please analyze the link again.",
             )
-        content = posts_store[req.post_id]["content"]
-        metadata = posts_store[req.post_id]["metadata"]
 
-        # 2. 构建提示词
+        entry = posts_store[req.post_id]
+        content = entry["content"]
+        metadata = entry["metadata"]
+        history: list = entry["history"]
+
         if not content or len(content.strip()) < 5:
             raise HTTPException(
                 status_code=400,
@@ -269,34 +299,32 @@ async def chat(req: ChatRequest):
 {content}
 
 【Rules】
-1. Use only information from the post content above. Summarize or paraphrase; do not invent (e.g. no "scan QR code" unless the post says so).
+1. Use only information from the post content above. Summarize or paraphrase; do not invent.
 2. Do not assume the user has a problem (e.g. account security) unless they or the post say so.
-3. For questions like "what does he/she talk about", "what is this about", "what's in the video/post": always give a short summary using the title and any text or transcript you have. Do NOT reply "The post doesn't mention this" for these general-summary questions if you have at least a title or any content.
-4. If the content says "[This post is a video" or "Video transcript" or "could not be transcribed", treat it as a video post: use [Video transcript] if present, or say it's a video and summarize the title and any text.
-5. Only say "The post doesn't mention this" when the user asks about something specific (e.g. a name, a number, a step) that truly does not appear in the content.
+3. For general summary questions ("what does he/she talk about", "what is this about"): always give a short summary using the title and any text or transcript you have.
+4. If the content says "[This post is a video" or "Video transcript" or "could not be transcribed", treat it as a video post.
+5. Only say "The post doesn't mention this" when the user asks about something specific that truly does not appear in the content.
 6. Be friendly. Respond in English only; translate any Chinese when you cite it."""
 
-        # 3. 调用Groq生成回答
-        api_key = os.getenv("GROQ_API_KEY")
-        if not api_key:
-            raise HTTPException(
-                status_code=500,
-                detail="GROQ_API_KEY not configured. Please set it in .env",
-            )
+        messages = [{"role": "system", "content": system_prompt}]
+        # include previous turns (keep last 20 to stay within token budget)
+        messages.extend(history[-20:])
+        messages.append({"role": "user", "content": req.message})
+
         print("🤖 调用AI生成回答...")
         response = groq_client.chat.completions.create(
             model="llama-3.1-8b-instant",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": req.message},
-            ],
+            messages=messages,
             temperature=0.4,
             max_tokens=1024,
         )
 
         reply = response.choices[0].message.content
-
         print("✅ AI回答生成完成")
+
+        # persist this turn into history
+        history.append({"role": "user", "content": req.message})
+        history.append({"role": "assistant", "content": reply})
 
         return {
             "success": True,
@@ -309,14 +337,11 @@ async def chat(req: ChatRequest):
         raise
     except Exception as e:
         import traceback
-
         print(f"❌ 对话错误: {str(e)}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# 启动服务
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
